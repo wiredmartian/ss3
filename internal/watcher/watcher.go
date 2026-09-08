@@ -22,6 +22,11 @@ type Watcher struct {
 
 	mu     sync.Mutex
 	timers map[string]*time.Timer
+	// wg tracks debounce-timer callbacks (see debounceWrite) that have
+	// fired and are running (or about to run) w.emit. run() waits on it
+	// before closing events/errs, so a callback can never send on a
+	// channel that has already been closed.
+	wg     sync.WaitGroup
 	events chan event.Event
 	errs   chan error
 }
@@ -62,9 +67,18 @@ func (w *Watcher) run(ctx context.Context) {
 		case <-ctx.Done():
 			w.mu.Lock()
 			for _, t := range w.timers {
-				t.Stop()
+				if t.Stop() {
+					// Canceled before it fired, so its callback (and the
+					// wg.Done it would have called) will never run: account
+					// for that here instead.
+					w.wg.Done()
+				}
 			}
 			w.mu.Unlock()
+			// Wait for any callback that had already fired (Stop returned
+			// false above, or fired before we even got here) to finish its
+			// own w.emit call before we close w.events/w.errs below.
+			w.wg.Wait()
 			return
 
 		case fsEv, ok := <-w.fsw.Events:
@@ -119,14 +133,32 @@ func (w *Watcher) debounceWrite(ctx context.Context, path string) {
 	defer w.mu.Unlock()
 
 	if t, ok := w.timers[path]; ok {
-		t.Stop()
+		if t.Stop() {
+			// Canceled before it fired: its callback (and the wg.Done it
+			// would have called) will never run, so balance the WaitGroup
+			// here instead.
+			w.wg.Done()
+		}
+		// If Stop returns false, the old timer already fired (or is in the
+		// middle of firing); its own callback is responsible for deleting
+		// its map entry (guarded below by identity, not just path) and for
+		// calling wg.Done() once it finishes.
 	}
-	w.timers[path] = time.AfterFunc(writeDebounce, func() {
+
+	w.wg.Add(1)
+	var t *time.Timer
+	t = time.AfterFunc(writeDebounce, func() {
+		defer w.wg.Done()
 		w.mu.Lock()
-		delete(w.timers, path)
+		// Only remove our own entry: if a newer timer for path has since
+		// replaced us in the map, leave it alone.
+		if w.timers[path] == t {
+			delete(w.timers, path)
+		}
 		w.mu.Unlock()
 		w.emit(ctx, event.Write, path)
 	})
+	w.timers[path] = t
 }
 
 func (w *Watcher) emit(ctx context.Context, t event.Type, path string) {
