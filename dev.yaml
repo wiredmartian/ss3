@@ -1,0 +1,4 @@
+watch_dir: ./data
+subscriptions:
+  - url: https://client.example.com/hook
+    events: [CREATE, WRITE, REMOVE, RENAME, CHMOD]
